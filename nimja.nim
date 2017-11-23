@@ -12,38 +12,39 @@ when isMainModule:
 
 type Strtab = OrderedTableRef[string, string]
 proc initStrtab(cap=1): Strtab = newOrderedTable[string, string](cap)
-type RuleVars = OrderedTableRef[string, EvalString]
-proc initRuleVars(): RuleVars = newOrderedTable[string, EvalString](1)
+type Rule = ref object
+  vars: OrderedTableRef[string, EvalString]
+  name: string
 
 type
+  InputKind = enum iExplicit, iImplicit, iOrderOnly
+  OutputKind = enum oExplicit, oImplicit
+  Input = tuple[path: string, kind: InputKind]
+  Output = tuple[path: string, kind: OutputKind]
+
   Target = ref TargetObj
   TargetObj = object
-    inputs*: seq[string]
-    implicits*: seq[string]
-    order_only*: seq[string]
-    outputs*: seq[string]
-    implicit_outs*: seq[string]
-    rule*: string
+    inputs*: seq[Input]
+    outputs*: seq[Output]
+    rule: Rule
     vars*: Strtab
-    command: string
+
+using
+  lexer: var Lexer
+  target: Target
 
 var
   vars: Strtab = initStrtab()
   defaults: seq[string] = @[]
   pools = initOrderedTable[string, int]()
   targets: seq[Target] = @[]
-  rules = initOrderedTable[string, RuleVars]()
+  rules = {"phony": Rule(name: "phony")}.toTable
 
 proc newTarget(): Target =
   result.new
   result.inputs = @[]
-  result.implicits = @[]
-  result.order_only = @[]
   result.outputs = @[]
-  result.implicit_outs = @[]
-  result.rule = ""
   result.vars = initStrtab()
-  result.command = ""
 
 proc eval(es: EvalString, varsTables: varargs[Strtab]): string =
   let sizeEstimate = foldl(es.parts):
@@ -68,23 +69,23 @@ proc eval(es: EvalString, varsTables: varargs[Strtab]): string =
             break expand
         raise newException(KeyError, "Undefined var: " & part.varName)
 
-proc fatal(lexer: var Lexer, msg: varargs[string, `$`]) {.noreturn.} =
+proc fatal(lexer; msg: varargs[string, `$`]) {.noreturn.} =
     lexer.makeError(join(msg))
     quit $lexer.getError
 
 template empty[T](container: T): bool = container.len == 0
 
-proc skipToken(lexer: var Lexer, expected: Token) =
+proc skipToken(lexer; expected: Token) =
   let found = lexer.readToken()
   if found != expected:
     lexer.fatal("Expected ", expected, " but found ", found)
 
-proc readIdent(lexer: var Lexer): string =
+proc readIdent(lexer): string =
   result = lexer.readIdentUnsafe()
   if result.empty:
     lexer.fatal("Expected ", IDENT, " but found ", lexer.readToken())
 
-iterator readPaths(lexer: var Lexer, varsTables: varargs[Strtab]): string =
+iterator readPaths(lexer; varsTables: varargs[Strtab]): string =
   var val = initEvalString()
   while true:
     val.parts.setLen(0)
@@ -94,62 +95,71 @@ iterator readPaths(lexer: var Lexer, varsTables: varargs[Strtab]): string =
       break
     yield val.eval(varsTables)
 
-proc parseVar(lexer: var Lexer): tuple[name: string, val: EvalString] =
+proc parseVar(lexer): tuple[name: string, val: EvalString] =
   result.name = lexer.readIdent()
   lexer.skipToken(EQUALS)
   result.val = initEvalString()
   if not lexer.readVarValueUnsafe(addr result.val):
     quit $lexer.getError()
 
-proc parseRule(lexer: var Lexer) =
-  var ruleVars = initRuleVars()
-  let name = lexer.readIdent()
+proc parseRule(lexer) =
+  var rule = Rule.new
+  rule.name = lexer.readIdent()
+  rule.vars = newOrderedTable[string, EvalString](1)
+
   lexer.skipToken(NEWLINE)
   while lexer.peekToken(INDENT):
     let (name, val) = lexer.parseVar()
-    ruleVars[name] = val
-  rules[name] = ruleVars
+    rule.vars[name] = val
+  try:
+    rules[rule.name] = rule
+  except KeyError:
+    lexer.fatal("Duplicate rule: " & rule.name)
   
-proc parseTarget(lexer: var Lexer) =
+proc parseTarget(lexer) =
   var target = newTarget()
 
   for path in lexer.readPaths(vars):
-    target.outputs &= path
+    target.outputs &= (path, oExplicit)
   if lexer.peekToken(PIPE):
     for path in lexer.readPaths(vars):
-      target.implicit_outs &= path
-  lexer.skipToken(COLON)
-
-  if target.outputs.empty() and target.implicit_outs.empty():
+      target.outputs &= (path, oImplicit)
+  if target.outputs.empty():
     lexer.fatal("Need an output")
 
-  target.rule = lexer.readIdent()
+  lexer.skipToken(COLON)
+  var ruleName = lexer.readIdent()
+  try:
+    target.rule = rules[ruleName]
+  except KeyError:
+    lexer.fatal("Unknown rule: " & ruleName)
 
   for path in lexer.readPaths(vars):
-    target.inputs &= path
+    target.inputs &= (path, iExplicit)
   if lexer.peekToken(PIPE):
     for path in lexer.readPaths(vars):
-      target.implicits &= path
+      target.inputs &= (path, iImplicit)
   if lexer.peekToken(PIPE2):
     for path in lexer.readPaths(vars):
-      target.order_only &= path
-  lexer.skipToken(NEWLINE)
+      target.inputs &= (path, iOrderOnly)
 
+  lexer.skipToken(NEWLINE)
   while lexer.peekToken(INDENT):
     let (name, val) = lexer.parseVar()
     target.vars[name] = val.eval(target.vars, vars)
-
-  if target.rule != "phony":
-    let rule = rules[target.rule]
-    var extra_vars = initStrtab(4)
-    let quoted_in = target.inputs.map(quoteShell)
-    vars["in"] = join(quoted_in, " ")
-    vars["in_newlines"] = join(quoted_in, "\n")
-    vars["out"] = join(target.outputs.map(quoteShell), " ")
-
-    target.command = rule["command"].eval(extra_vars, target.vars, vars)
-
   targets &= target
+
+proc magicVars(target): Strtab =
+  let quoted_in =
+    target.inputs.filterIt(it.kind == iExplicit)
+                 .mapIt(it.path.quoteShell)
+  let quoted_out =
+    target.outputs.filterIt(it.kind == oExplicit)
+                  .mapIt(it.path.quoteShell)
+  result = initStrtab(4)
+  result["in"] = join(quoted_in, " ")
+  result["in_newlines"] = join(quoted_in, "\n")
+  result["out"] = join(quoted_out, " ")
 
 proc parseManifest(fileName: string) =
   proc loadFile(): string =
@@ -201,7 +211,7 @@ proc parseManifest(fileName: string) =
         lexer.fatal("Expected a path")
     of BUILD:
       lexer.parseTarget()
-    of RULE:
+    of Token.RULE:
       lexer.parseRule()
 
 when isMainModule:
@@ -213,7 +223,10 @@ when isMainModule:
       discard #TODO build stuff
     of tCommands:
       for t in targets:
-        echo t.command # TODO consider targets and order
+        if t.rule.name != "phony":
+          # TODO need to handle rule-vars referring to others,
+          # but watch out for cycles!
+          echo t.rule.vars["command"].eval(t.magicVars, t.vars, vars)
   except Exception as ex:
     stderr.write("Exception: " & $ex.name & ": " & ex.msg)
     quit getStackTrace(ex)
