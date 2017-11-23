@@ -8,7 +8,7 @@ import strutils
 import sequtils
 
 when isMainModule:
-  from arg_parser import args
+  import arg_parser
 
 type Strtab = OrderedTableRef[string, string]
 proc initStrtab(cap=1): Strtab = newOrderedTable[string, string](cap)
@@ -151,17 +151,21 @@ proc parseTarget(lexer: var Lexer) =
 
   targets &= target
 
-proc main() =
-  let raw = readFile(args.manifest)
+proc parseManifest(fileName: string) =
+  proc loadFile(): string =
+    result = readFile(fileName)
+    result.shallow
+    result.GC_ref # Keep file buffers alive to allow EvalString to hold views.
+  let raw = loadFile()
   var lexer = constructLexer()
-  lexer.start(args.manifest, raw)
+  lexer.start(fileName, raw)
 
   while true:
     let tok = lexer.readToken()
     case tok
     of TEOF: break
     of NEWLINE: continue
-    of SUBNINJA, INCLUDE:
+    of SUBNINJA:
       lexer.fatal("Not supported yet")
     of ERROR:
       quit $lexer.getError()
@@ -169,7 +173,7 @@ proc main() =
       lexer.fatal("misplaced token " & $tok)
     of DEFAULT:
       var havePath = false
-      for path in lexer.readPaths:
+      for path in lexer.readPaths(vars):
         defaults &= path
         havePath = true
       if not havePath:
@@ -188,6 +192,13 @@ proc main() =
       assert depth == "depth"
       pools[name] = parseInt(val.eval())
 
+    of INCLUDE:
+      block includeBlock:
+        for file in lexer.readPaths(vars):
+          parseManifest(file)
+          lexer.skipToken(NEWLINE)
+          break includeBlock
+        lexer.fatal("Expected a path")
     of BUILD:
       lexer.parseTarget()
     of RULE:
@@ -195,10 +206,14 @@ proc main() =
 
 when isMainModule:
   try:
-    main()
-    for t in targets:
-      discard
-      #echo t.commands
+    parseManifest(args.manifest)
+
+    case args.tool
+    of tNone:
+      discard #TODO build stuff
+    of tCommands:
+      for t in targets:
+        echo t.command # TODO consider targets and order
   except Exception as ex:
     stderr.write("Exception: " & $ex.name & ": " & ex.msg)
     quit getStackTrace(ex)
