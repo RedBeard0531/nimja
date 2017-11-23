@@ -11,8 +11,10 @@ Usage:
   declared in the manifest
 
 Options:
+  -C DIR         cd to this directory before doing anything else
   -f FILE        path to build manifest [default: build.ninja]
   -h --help      show this help
+
   -t commands    print all commands that would be executed
                  to build targets without building anything
 """
@@ -23,25 +25,28 @@ type Tool* = enum
 
 type Args = object
   manifest*: string
+  dir*: string
   targets*: seq[string]
   case tool*: Tool
   of tNone, tCommands:
     discard # No tool-specific args
-  
 
 proc parseArgs(): Args =
   let rawArgs = docopt help
   when defined(debugArgParse):
     quit $rawArgs
   result.manifest = $rawArgs["-f"]
+  result.manifest = $rawArgs["-f"]
   result.targets = @(rawArgs["<targets>"])
 
-  case $rawArgs["-t"]
-  of "nil":
-    result.tool = tNone
-  of "commands":
-    result.tool = tCommands
-  else:
-    quit "Unknown tool " & $rawArgs["-t"]
+  if rawArgs["-C"]:
+    result.dir = $rawArgs["-C"]
+
+  if rawArgs["-t"]:
+    case $rawArgs["-t"]
+    of "commands":
+      result.tool = tCommands
+    else:
+      quit "Unknown tool " & $rawArgs["-t"]
 
 let args* = parseArgs()

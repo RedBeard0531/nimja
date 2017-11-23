@@ -274,6 +274,9 @@ proc targets(): seq[string] =
 
 when isMainModule:
   try:
+    if args.dir != nil:
+      setCurrentDir(args.dir)
+
     parseManifest(args.manifest)
     populateFSFromActions()
 
