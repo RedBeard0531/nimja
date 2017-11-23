@@ -6,6 +6,7 @@ import osproc
 import tables
 import strutils
 import sequtils
+import times
 
 when isMainModule:
   import arg_parser
@@ -22,29 +23,43 @@ type
   Input = tuple[path: string, kind: InputKind]
   Output = tuple[path: string, kind: OutputKind]
 
-  Target = ref TargetObj
-  TargetObj = object
+  BuildAction = ref BuildActionObj
+  BuildActionObj = object
     inputs*: seq[Input]
     outputs*: seq[Output]
     rule: Rule
     vars*: Strtab
+    executed: bool
+    seen: bool
+
+  BuildNode = ref BuildNodeObj
+  BuildNodeObj = object of RootObj
+    name*: string
+    mtime*: Time # Time.low means unknown
+    action*: BuildAction # nil means it should be a file
 
 using
   lexer: var Lexer
-  target: Target
+  action: BuildAction
+  node: BuildNode
 
 var
   vars: Strtab = initStrtab()
   defaults: seq[string] = @[]
   pools = initOrderedTable[string, int]()
-  targets: seq[Target] = @[]
+  actions: seq[BuildAction] = @[]
   rules = {"phony": Rule(name: "phony")}.toTable
+  fs = initTable[string, BuildNode]()
 
-proc newTarget(): Target =
+proc newBuildAction(): BuildAction =
   result.new
   result.inputs = @[]
   result.outputs = @[]
   result.vars = initStrtab()
+
+proc newNode(name: string): BuildNode =
+  result.new
+  result.name = name
 
 proc eval(es: EvalString, varsTables: varargs[Strtab]): string =
   let sizeEstimate = foldl(es.parts):
@@ -116,45 +131,45 @@ proc parseRule(lexer) =
   except KeyError:
     lexer.fatal("Duplicate rule: " & rule.name)
   
-proc parseTarget(lexer) =
-  var target = newTarget()
+proc parseAction(lexer) =
+  var action = newBuildAction()
 
   for path in lexer.readPaths(vars):
-    target.outputs &= (path, oExplicit)
+    action.outputs &= (path, oExplicit)
   if lexer.peekToken(PIPE):
     for path in lexer.readPaths(vars):
-      target.outputs &= (path, oImplicit)
-  if target.outputs.empty():
+      action.outputs &= (path, oImplicit)
+  if action.outputs.empty():
     lexer.fatal("Need an output")
 
   lexer.skipToken(COLON)
   var ruleName = lexer.readIdent()
   try:
-    target.rule = rules[ruleName]
+    action.rule = rules[ruleName]
   except KeyError:
     lexer.fatal("Unknown rule: " & ruleName)
 
   for path in lexer.readPaths(vars):
-    target.inputs &= (path, iExplicit)
+    action.inputs &= (path, iExplicit)
   if lexer.peekToken(PIPE):
     for path in lexer.readPaths(vars):
-      target.inputs &= (path, iImplicit)
+      action.inputs &= (path, iImplicit)
   if lexer.peekToken(PIPE2):
     for path in lexer.readPaths(vars):
-      target.inputs &= (path, iOrderOnly)
+      action.inputs &= (path, iOrderOnly)
 
   lexer.skipToken(NEWLINE)
   while lexer.peekToken(INDENT):
     let (name, val) = lexer.parseVar()
-    target.vars[name] = val.eval(target.vars, vars)
-  targets &= target
+    action.vars[name] = val.eval(action.vars, vars)
+  actions &= action
 
-proc magicVars(target): Strtab =
+proc magicVars(action): Strtab =
   let quoted_in =
-    target.inputs.filterIt(it.kind == iExplicit)
+    action.inputs.filterIt(it.kind == iExplicit)
                  .mapIt(it.path.quoteShell)
   let quoted_out =
-    target.outputs.filterIt(it.kind == oExplicit)
+    action.outputs.filterIt(it.kind == oExplicit)
                   .mapIt(it.path.quoteShell)
   result = initStrtab(4)
   result["in"] = join(quoted_in, " ")
@@ -210,23 +225,68 @@ proc parseManifest(fileName: string) =
           break includeBlock
         lexer.fatal("Expected a path")
     of BUILD:
-      lexer.parseTarget()
+      lexer.parseAction()
     of Token.RULE:
       lexer.parseRule()
+
+proc populateFSFromActions() =
+  for action in actions:
+    for output, kind in action.outputs.items:
+      var node = newNode(output)
+      node.action = action
+      fs[output] = node
+
+type CycleDetected = object of Exception
+  path: seq[string]
+
+proc printCommands(next: string) =
+  let node = fs.getOrDefault(next)
+  if node == nil: return
+  var action = node.action
+  if action == nil: return
+  if action.executed: return
+
+  if action.seen:
+    var x = newException(CycleDetected, "CycleDetected")
+    x.path = @[next]
+    raise x
+  action.seen = true
+
+  for input in action.inputs:
+    try:
+      printCommands(input.path)
+    except CycleDetected as ex:
+      ex.path &= next
+      raise
+
+  action.executed = true
+
+  if action.rule.name != "phony":
+    # TODO need to handle rule-vars referring to others,
+    # but watch out for cycles!
+    echo action.rule.vars["command"].eval(action.magicVars, action.vars, vars)
+
+proc targets(): seq[string] =
+  if args.targets.empty:
+    defaults
+  else:
+    args.targets
 
 when isMainModule:
   try:
     parseManifest(args.manifest)
+    populateFSFromActions()
 
     case args.tool
     of tNone:
       discard #TODO build stuff
     of tCommands:
-      for t in targets:
-        if t.rule.name != "phony":
-          # TODO need to handle rule-vars referring to others,
-          # but watch out for cycles!
-          echo t.rule.vars["command"].eval(t.magicVars, t.vars, vars)
+      try:
+        for t in targets():
+          printCommands(t)
+      except CycleDetected as ex:
+        quit ("dependency cycle detected: " & join(ex.path, " <- "))
+
   except Exception as ex:
     stderr.write("Exception: " & $ex.name & ": " & ex.msg)
     quit getStackTrace(ex)
