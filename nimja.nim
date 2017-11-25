@@ -5,6 +5,7 @@ import ospaths
 import osproc
 import tables
 import strutils
+import strfmt
 import sequtils
 import times
 
@@ -272,6 +273,20 @@ proc targets(): seq[string] =
   else:
     args.targets
 
+proc checkValidTarget(target: string) =
+  if target notin fs:
+    var best = (score: int.high, str: "")
+    for output in fs.keys:
+      let d = editDistance(target, output)
+      if d < best.score:
+        best.score = d
+        best.str = output
+
+    if best.str.empty:
+      quit $$"unknown target '$target'"
+    else:
+      quit $$"unknown target '$target'\ndid you mean '${best.str}'"
+
 when isMainModule:
   try:
     if args.dir != nil:
@@ -286,9 +301,11 @@ when isMainModule:
     of tCommands:
       try:
         for t in targets():
+          checkValidTarget(t)
+        for t in targets():
           printCommands(t)
       except CycleDetected as ex:
-        quit ("dependency cycle detected: " & join(ex.path, " <- "))
+        quit $$"dependency cycle detected: ${ex.path:a| <- }"
 
   except Exception as ex:
     stderr.write("Exception: " & $ex.name & ": " & ex.msg)

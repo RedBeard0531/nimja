@@ -13,6 +13,7 @@ backend = "cpp"
 
 requires "nim >= 0.17.2"
 requires "docopt"
+requires "strfmt"
 
 before build:
   exec "nim re2c"
