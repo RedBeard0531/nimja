@@ -5,6 +5,7 @@ import tables
 import strutils
 import sequtils
 import utils
+import asyncdispatch
 
 type
   Rule* = ref object
@@ -24,6 +25,7 @@ type
     vars*: Vars
     executed*: bool
     seen*: bool
+    run*: Future[void]
 
   Manifest* = ref ManifestObj
   ManifestObj* = object

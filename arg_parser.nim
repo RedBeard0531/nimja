@@ -1,6 +1,9 @@
 import docopt
+import strutils
+import osproc
+import strfmt
 
-let help = """nimja builds things
+let help = $$"""nimja builds things
 
 Usage:
   nimja [options] [<targets> ...]
@@ -13,6 +16,7 @@ Usage:
 Options:
   -C DIR         cd to this directory before doing anything else
   -f FILE        path to build manifest [default: build.ninja]
+  -j JOBS        how many jobs to run in parallel [default: ${countProcessors()}]
   -h --help      show this help
 
   -t commands    print all commands that would be executed
@@ -27,6 +31,7 @@ type Args = object
   manifest*: string
   dir*: string
   targets*: seq[string]
+  jobs*: int
   case tool*: Tool
   of tNone, tCommands:
     discard # No tool-specific args
@@ -36,7 +41,7 @@ proc parseArgs(): Args =
   when defined(debugArgParse):
     quit $rawArgs
   result.manifest = $rawArgs["-f"]
-  result.manifest = $rawArgs["-f"]
+  result.jobs = ($rawArgs["-j"]).parseInt()
   result.targets = @(rawArgs["<targets>"])
 
   if rawArgs["-C"]:
