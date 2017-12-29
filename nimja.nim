@@ -292,5 +292,4 @@ when isMainModule:
   except Exception as ex:
     stderr.write("Exception: " & $ex.name & ": " & ex.msg)
     quit getStackTrace(ex)
-    quit 1
 
