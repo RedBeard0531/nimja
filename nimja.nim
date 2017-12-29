@@ -15,7 +15,10 @@ import asyncdispatch
 import asyncfile
 
 #import osproc
-import asynctools/asyncproc
+when declared(quoteShell):
+  import asynctools/asyncproc except quoteShell
+else:
+  import asynctools/asyncproc
 
 when isMainModule:
   import arg_parser
@@ -26,8 +29,8 @@ type
     name*: string
     action*: BuildAction # nil means it should be a file
     case haveMtime: bool
-    of false: discard
-    of true: mtime*: Time
+    of false: discard # default state
+    of true: mtime*: MTime
 
 using
   action: BuildAction
@@ -40,6 +43,36 @@ var
 proc newNode(name: string): BuildNode =
   result.new
   result.name = name
+
+proc newestInput(node): MTime =
+  if node.action.inputs.empty:
+    Oldest()
+  else:
+    max node.action.inputs
+        .filterIt(it.kind != iOrderOnly)
+        .mapIt do:
+          assert fs[it.path].haveMtime
+          fs[it.path].mtime
+
+proc assumeDirty(node) =
+  node.haveMtime = true
+  node.mtime = Newest()
+
+proc fillMtime(node; force=false) =
+  if not force and node.haveMtime: return
+
+  node.haveMtime = true
+  if node.name.fileExists:
+    node.mtime = Known(node.name.getLastModificationTime)
+  elif node.action.isNil:
+    raise newException(Exception, "no rule to build " & node.name)
+  elif node.action.rule.name == "phony":
+    if node.action.inputs.empty:
+      node.mtime = Newest()
+    else:
+      node.mtime = newestInput(node)
+  else:
+    node.mtime = Oldest()
 
 proc magicVars(action): Vars =
   let quoted_in =
@@ -142,9 +175,27 @@ type Process = object
   output: string
   status: int
 
+proc isRestat(action): bool =
+  let restat = action.evalRuleVar("restat")
+  case restat
+  of "", "0": return false
+  of "1": return true
+  else:
+    raise newException(
+      Exception,
+      $$"Illegal restat value '$restat' in rule ${action.rule.name}")
+
+proc fillMtimeMaybeRestat(node) =
+  if node.action.isRestat:
+    node.fillMtime(force=true)
+  else:
+    node.assumeDirty
+
 var allGood = true
 proc launch(cmd: string): Future[Process] {.async.} =
-  let p = await execProcess(cmd)
+  var opts = {poStdErrToStdOut, poUsePath, poEvalCommand}
+  when false: opts.incl poEchoCmd
+  let p = await execProcess(cmd, options=opts)
   result.output = p.output
   result.status = p.exitcode
 
@@ -162,19 +213,29 @@ proc run(action): Future[Process] =
     writeFile(rspFile, rspContent)
   return launch(command)
 
-
 proc build(target: string): Future[void]
 
-proc buildImpl(target: string, action): Future[void] {.async.} =
+proc buildImpl(target: string, node, action): Future[void] {.async.} =
   if not allGood: return
-  when false:
-    # This requires nim PR #6850 to fix a bug in all()
-    await all action.inputs.mapIt(build it.path).filterIt(not it.isNil)
-  else:
-    var futs = action.inputs.mapIt(build it.path).filterIt(not it.isNil)
-    for fut in futs: await fut
+  await all action.inputs.mapIt(build it.path).filterIt(not it.isNil)
+  if not allGood: return
+
+  var seenSelf = false
+  var oldestOutput = Newest()
+  for output in action.outputs:
+    let oNode = fs[output.path]
+    if not oNode.haveMtime:
+      oNode.fillMtime
+    if oNode == node: seenSelf = true
+    oldestOutput = min(oldestOutput, oNode.mtime)
+
+  assert seenSelf
+
+  let anyMissing = oldestOutput == Oldest()
+  if not anyMissing and oldestOutput >= node.newestInput: return
 
   if action.rule.name == "phony": return
+
   while true:
     let ticket = startJob()
     if ticket.isNil: break
@@ -182,8 +243,13 @@ proc buildImpl(target: string, action): Future[void] {.async.} =
   if not allGood:
     finishJob()
     return
+
   let p = await run(action)
   finishJob()
+
+  for output in action.outputs:
+    fs[output.path].fillMtimeMaybeRestat()
+
   if p.status != 0:
     allgood = false
     raise newException(Exception, $$"Failed on $target: ${p.status}\n ${p.output}")
@@ -191,12 +257,14 @@ proc buildImpl(target: string, action): Future[void] {.async.} =
 
 proc build(target: string): Future[void] =
   if not allGood: return
-  let node = fs.getOrDefault(target)
-  if node == nil: return
+  let node = addr fs.mgetOrPut(target, nil)
+  if node[] == nil: node[] = newNode(target)
   var action = node.action
-  if action == nil: return
+  if action == nil:
+    node.fillMtime()
+    return
   if action.run == nil:
-    action.run = buildImpl(target, action)
+    action.run = buildImpl(target, node[], action)
   return action.run
 
 when isMainModule:

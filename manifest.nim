@@ -23,6 +23,8 @@ type
     outputs*: seq[Output]
     rule*: Rule
     vars*: Vars
+    # The rest are states for execution.
+    # TODO pull out to separate class?
     executed*: bool
     seen*: bool
     run*: Future[void]

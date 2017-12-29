@@ -1,6 +1,8 @@
 import tables
 import strutils
 import sequtils
+import times
+import patty
 
 export tables # needed to do anything with Vars
 
@@ -26,6 +28,25 @@ type
 
   EvalString* {.exportc.} = object
     parts: seq[EvalStringPart]
+
+variantp MTime:
+  Oldest
+  Known(mtime: Time)
+  Newest
+
+proc `<`*(a,b: MTime): bool {.inline.} =
+  if a.kind != b.kind:
+    return a.kind < b.kind
+  if a.kind == MTimeKind.Known:
+    return a.mtime < b.mtime
+  return false # equal Oldest or Newest
+
+proc `<=`*(a,b: MTime): bool {.inline.} =
+  if a.kind != b.kind:
+    return a.kind <= b.kind
+  if a.kind == MTimeKind.Known:
+    return a.mtime <= b.mtime
+  return true # equal Oldest or Newest
 
 proc newStrtab*(cap=1): Vars = newOrderedTable[string, string](cap)
 
@@ -71,4 +92,4 @@ proc eval*(es: EvalString, varsTables: varargs[Vars]): string =
           if part.varName in vars:
             result &= vars[part.varName]
             break expand
-        raise newException(KeyError, "Undefined var: " & part.varName)
+        echo "WARNING: undefined var $" & part.varName
