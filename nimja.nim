@@ -1,5 +1,9 @@
 {.experimental.} # automatic deference first param
 
+import manifest as manifestMod
+import utils
+import depsfile
+
 import os
 import ospaths
 import tables
@@ -7,9 +11,8 @@ import strutils
 import strfmt
 import sequtils
 import times
-import manifest as manifestMod
-import utils
 import deques
+import future
 
 import asyncdispatch
 import asyncfile
@@ -44,11 +47,11 @@ proc newNode(name: string): BuildNode =
   result.new
   result.name = name
 
-proc newestInput(node): MTime =
-  if node.action.inputs.empty:
+proc newestInput(action): MTime =
+  if action.inputs.empty:
     Oldest()
   else:
-    max node.action.inputs
+    max action.inputs
         .filterIt(it.kind != iOrderOnly)
         .mapIt do:
           assert fs[it.path].haveMtime
@@ -70,7 +73,7 @@ proc fillMtime(node; force=false) =
     if node.action.inputs.empty:
       node.mtime = Newest()
     else:
-      node.mtime = newestInput(node)
+      node.mtime = node.action.newestInput
   else:
     node.mtime = Oldest()
 
@@ -220,21 +223,34 @@ proc buildImpl(target: string, node, action): Future[void] {.async.} =
   await all action.inputs.mapIt(build it.path).filterIt(not it.isNil)
   if not allGood: return
 
-  var seenSelf = false
-  var oldestOutput = Newest()
-  for output in action.outputs:
-    let oNode = fs[output.path]
-    if not oNode.haveMtime:
-      oNode.fillMtime
-    if oNode == node: seenSelf = true
-    oldestOutput = min(oldestOutput, oNode.mtime)
+  block checkIfUpToDate:
+    var seenSelf = false
+    var oldestOutput = Newest()
+    for output in action.outputs:
+      let oNode = fs[output.path]
+      if not oNode.haveMtime:
+        oNode.fillMtime
+      if oNode == node: seenSelf = true
+      oldestOutput = min(oldestOutput, oNode.mtime)
 
-  assert seenSelf
+    assert seenSelf
 
-  let anyMissing = oldestOutput == Oldest()
-  if not anyMissing and oldestOutput >= node.newestInput: return
+    if action.rule.name == "phony": return
 
-  if action.rule.name == "phony": return
+    let anyMissing = oldestOutput == Oldest()
+    if not anyMissing and oldestOutput >= action.newestInput:
+      let depfile = action.evalRuleVar("depfile")
+      if fileExists(depfile):
+        let deps = depfile.readFile.parseDeps
+        assert deps.output == target
+        for input in deps.inputs:
+          let iNode = addr fs.mgetOrPut(input, nil)
+          if iNode[] == nil: iNode[] = newNode(input)
+          if not iNode.haveMtime:
+            iNode.fillMtime
+          if iNode.mtime > oldestOutput:
+            break checkIfUpToDate # not up to date
+      return # up to date
 
   while true:
     let ticket = startJob()
